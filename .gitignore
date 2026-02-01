@@ -15,4 +15,4 @@
 # (Optional) If you have build scripts, you might want to uncomment these:
 # !Makefile
 # !CMakeLists.txt
-# !README.md
+!README.md

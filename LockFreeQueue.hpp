@@ -7,29 +7,30 @@
 template <typename T, size_t Size> class LockFreeQueue {
 private:
   std::vector<T> buffer;
-  alignas(64) std::atomic<size_t> head;
-  alignas(64) std::atomic<size_t> tail;
+  alignas(64) std::atomic<size_t> head{0};
+  alignas(64) std::atomic<size_t> tail{0};
 
 public:
-  LockFreeQueue() : buffer(Size), head(0), tail(0) {}
+  LockFreeQueue() : buffer(Size) {}
 
   bool push(const T &item) {
-    const size_t current_head = head.load(std::memory_order_relaxed);
-    const size_t next_head = (current_head + 1) % Size;
-    if (next_head == tail.load(std::memory_order_acquire))
+    const size_t currentHead = head.load(std::memory_order_relaxed);
+    const size_t nextHead = (currentHead + 1) % Size;
+    if (nextHead == tail.load(std::memory_order_acquire))
       return false;
-    buffer[current_head] = item;
-    head.store(next_head, std::memory_order_release);
+    buffer[currentHead] = item;
+    head.store(nextHead, std::memory_order_release);
     return true;
   }
 
   bool pop(T &item) {
-    const size_t current_tail = tail.load(std::memory_order_relaxed);
-    if (current_tail == head.load(std::memory_order_acquire))
+    const size_t currentTail = tail.load(std::memory_order_relaxed);
+    if (currentTail == head.load(std::memory_order_acquire))
       return false;
-    item = buffer[current_tail];
-    tail.store((current_tail + 1) % Size, std::memory_order_release);
+    item = buffer[currentTail];
+    tail.store((currentTail + 1) % Size, std::memory_order_release);
     return true;
   }
 };
+
 #endif

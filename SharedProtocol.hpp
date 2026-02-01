@@ -3,39 +3,50 @@
 
 #include <cstdint>
 
-// FORCE 1-BYTE ALIGNMENT (No Padding)
 #pragma pack(push, 1)
 
-// 1. INPUT: Raw Order (36 Bytes)
-// Python: struct.pack('diQiqi', ...)
+// MDMessage (36 Bytes) - Engine Input
 struct MDMessage {
-  double time;             // 8 bytes
-  int eventType;           // 4 bytes
-  uint64_t orderId;        // 8 bytes
-  int size;                // 4 bytes
-  uint64_t price;          // 8 bytes
-  int direction;           // 4 bytes
-} __attribute__((packed)); // GCC/Clang specific safety
+  double time;
+  int32_t eventType;
+  uint64_t orderId;
+  int32_t size;
+  uint64_t price;
+  int32_t direction;
+} __attribute__((packed));
 
-// 2. OUTPUT: Engine State (32 Bytes)
+// LOBSnapshot (248 Bytes) - MBP-10 for DeepLOB
+struct LOBSnapshot {
+  double time;
+  uint64_t bidPrice[10];
+  int32_t bidSize[10];
+  uint64_t askPrice[10];
+  int32_t askSize[10];
+} __attribute__((packed));
+
+// EngineState (32 Bytes) - BBO for validation
 struct EngineState {
   double lastTime;
   uint64_t bidPrice;
-  int bidSize;
+  int32_t bidSize;
   uint64_t askPrice;
-  int askSize;
+  int32_t askSize;
 } __attribute__((packed));
 
-// 3. TRUTH: Reference Snapshot (32 Bytes)
-// Python: struct.pack('dQiqi', ...)
+// TruthMessage (32 Bytes) - Ground truth
 struct TruthMessage {
-  double time;       // 8 bytes
-  uint64_t bidPrice; // 8 bytes
-  int bidSize;       // 4 bytes
-  uint64_t askPrice; // 8 bytes
-  int askSize;       // 4 bytes
+  double time;
+  uint64_t bidPrice;
+  int32_t bidSize;
+  uint64_t askPrice;
+  int32_t askSize;
 } __attribute__((packed));
 
 #pragma pack(pop)
+
+static_assert(sizeof(MDMessage) == 36, "MDMessage must be 36 bytes");
+static_assert(sizeof(LOBSnapshot) == 248, "LOBSnapshot must be 248 bytes");
+static_assert(sizeof(EngineState) == 32, "EngineState must be 32 bytes");
+static_assert(sizeof(TruthMessage) == 32, "TruthMessage must be 32 bytes");
 
 #endif
