@@ -1,0 +1,20 @@
+# 1. Ignore EVERYTHING by default
+*
+
+# 2. Keep directories (to preserve structure)
+!*/
+
+# 3. Whitelist specific source extensions
+!*.cpp
+!*.hpp
+!*.py
+
+# 4. Keep the .gitignore file itself
+!.gitignore
+
+# Optional build scripts
+# !Makefile
+# !CMakeLists.txt
+
+# Keep README
+!README.md
