@@ -1,20 +1,24 @@
-# 1. Ignore EVERYTHING by default
+# Ignore EVERYTHING by default
 *
 
-# 2. Keep directories (to preserve structure)
+# Always keep directory structure
 !*/
 
-# 3. Whitelist specific source extensions
+# ---- C++ source allowed anywhere ----
 !*.cpp
 !*.hpp
-!*.py
 
-# 4. Keep the .gitignore file itself
+# ---- Python allowed ONLY inside scripts ----
+scripts/
+!scripts/
+!scripts/*.py
+
+# ---- Keep repo essentials ----
 !.gitignore
-
-# Optional build scripts
-# !Makefile
-# !CMakeLists.txt
-
-# Keep README
 !README.md
+
+# ---- Explicit junk ignores ----
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+*.ipynb
+
