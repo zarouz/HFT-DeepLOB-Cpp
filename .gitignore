@@ -22,7 +22,7 @@
 # Python allowed ONLY inside scripts/
 # =====================================
 !scripts/
-scripts/*
+!scripts/**/
 !scripts/**/*.py
 
 # =====================================
