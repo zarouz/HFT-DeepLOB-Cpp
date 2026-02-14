@@ -1,24 +1,60 @@
-# Ignore EVERYTHING by default
+# =====================================
+# Default: ignore EVERYTHING
+# =====================================
 *
 
-# Always keep directory structure
+# Keep folder structure visible
 !*/
 
-# ---- C++ source allowed anywhere ----
-!*.cpp
-!*.hpp
-
-# ---- Python allowed ONLY inside scripts ----
-scripts/
-!scripts/
-!scripts/*.py
-
-# ---- Keep repo essentials ----
+# =====================================
+# Repo essentials
+# =====================================
 !.gitignore
 !README.md
 
-# ---- Explicit junk ignores ----
+# =====================================
+# C++ source allowed anywhere
+# =====================================
+!*.cpp
+!*.hpp
+
+# =====================================
+# Python allowed ONLY inside scripts/
+# =====================================
+!scripts/
+scripts/*
+!scripts/**/*.py
+
+# =====================================
+# Config / shell helpers (optional)
+# =====================================
+!*.sh
+!requirements.txt
+
+# =====================================
+# Explicit junk ignores
+# =====================================
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 *.ipynb
+__pycache__/
+*.pyc
+
+# =====================================
+# ML artifacts (NEVER commit)
+# =====================================
+models/
+checkpoints/
+logs/
+data/
+datasets/
+*.pt
+*.pth
+*.ckpt
+
+# =====================================
+# Virtual environments
+# =====================================
+venv/
+.env
 
