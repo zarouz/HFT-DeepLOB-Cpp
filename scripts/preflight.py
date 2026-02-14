@@ -1,3 +1,4 @@
+# scripts/preflight.py
 import os, sys, importlib
 
 print("=" * 50)

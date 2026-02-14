@@ -1,3 +1,4 @@
+# scripts/generate_datasets_parallel.py
 #!/usr/bin/env python3
 """
 Parallel C++ dataset generation using Python multiprocessing.

@@ -1,3 +1,4 @@
+# scripts/process_all_days_parallel.py
 #!/usr/bin/env python3
 """
 Parallel processing of all days - uses all CPU cores.

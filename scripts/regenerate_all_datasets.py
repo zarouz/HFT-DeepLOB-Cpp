@@ -1,3 +1,5 @@
+# scripts/regenerate_all_datasets.py -> stick to this
+
 #!/usr/bin/env python3
 """
 Regenerate all datasets with the FIXED processor.

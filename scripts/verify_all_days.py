@@ -1,3 +1,4 @@
+# scripts/verify_all_days.py
 #!/usr/bin/env python3
 """
 Quick check that all days processed correctly.

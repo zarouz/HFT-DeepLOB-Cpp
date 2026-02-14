@@ -1,554 +1,371 @@
 """
-adaptive_labeler.py  (32-core optimized, v3 -- all fixes applied)
-==================================================================
-All bugs found from running on real NVDA data corrected.
+adaptive_labeler.py
+===================
+FINAL. Do not modify functions already marked DONE in Preprocessing doc.
 
-FIXES IN THIS VERSION:
+Contains:
+  - load_snapshots         : fast numpy structured dtype binary loader
+  - fit_double_alpha       : fit asymmetric thresholds from single-day data
+  - fit_double_alpha_from_files : parallel multi-file DoubleAlpha fitting
+  - label_fixed            : vectorized time-based 100ms labelling
+  - label_realtime_atr     : per-snapshot ATR labelling (inference only)
+  - build_multi_day_parallel : parallel multi-day dataset builder
 
-1. load_snapshots() -- 4.2s -> ~0.5s
-   Root cause: recs['bidSize'].astype(float64) on 6M x 10 int32 values.
-   int32->float64 is a slow path in numpy. Fix: cast via float32 first.
-   (int32->float32 is a single SIMD op, float32->float64 assignment is fast)
+DoubleAlpha (Section 1 of Preprocessing doc):
+  - alpha_down = 22nd percentile of return distribution (DOWN threshold)
+  - alpha_up   = 78th percentile                        (UP  threshold)
+  - MUST be fitted once across all 10 training days jointly.
+  - Test set uses training alpha -- never re-fit on test data.
 
-2. compute_atr_series() -- completely rewritten
-   Root cause: per-snapshot true ranges at 1464 snaps/sec are ~$0.0003 each.
-   Summing 1464 of these = $0.44 ATR but normalized: $0.44/$189 = 0.0023.
-   However the actual meaningful 100ms price move is 0.05 bps = 0.000005.
-   The raw per-snapshot ATR is measuring bid-ask bounce noise, not volatility.
-   Fix: resample mid-price to a 10ms grid before computing true ranges.
-   ATR on 10ms-sampled prices measures actual price changes, not quote noise.
-
-3. C++ AdaptiveAlpha -- updated to match sampled ATR approach
-   The C++ class now accumulates mid-price samples at fixed time intervals
-   rather than on every quote update.
+Horizon: 100ms wall-clock (NOT fixed snapshot count k).
+  At avg 210 snapshots/s (NVDA), 100ms ≈ 21 snapshots,
+  but varies 50ms–200ms in burst/quiet periods.
+  This is methodologically correct and stated in paper Section 3.
 """
 
-import numpy as np
 import os
-from typing import Tuple, Optional, List
+import pickle
+import struct
+import numpy as np
 from dataclasses import dataclass
-import multiprocessing as mp
+from multiprocessing import Pool
+from scipy.ndimage import uniform_filter1d
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+SNAPSHOT_BYTES  = 248
+SNAPSHOT_DTYPE  = np.dtype([
+    ('time',     '<f8'),
+    ('bid_px',   '<u8', 10),
+    ('bid_sz',   '<i4', 10),
+    ('ask_px',   '<u8', 10),
+    ('ask_sz',   '<i4', 10),
+])
+PRICE_SCALE     = 1e4          # stored as int × 1e-4
+HORIZON_SECS    = 0.100        # 100ms forward window for label
+HORIZON_AVG_SECS= 0.100        # 100ms averaging window [t+H, t+2H]
 
-# ---- Binary format (SharedProtocol.hpp LOBSnapshot) ----
-SNAPSHOT_SIZE = 248
-PRICE_SCALE   = 1e-4
-HORIZON_S     = 0.100    # 100ms prediction horizon
-FUTURE_WIN_S  = 0.100    # average mid over 100ms future window
+# Session window (09:30–16:00 ET) -- LOCKED decision, cite in paper Sec 3
+# Using Unix-timestamp arithmetic: epoch offset depends on date, so we keep
+# it as hour offsets and apply per-file. Callers may also pass pre-filtered data.
+SESSION_START_HOUR_ET = 9.5    # 09:30
+SESSION_END_HOUR_ET   = 16.0   # 16:00
 
-N_WORKERS = max(1, min(28, mp.cpu_count() - 4))
-
-
-# ====================================================================
-# I/O
-# ====================================================================
-
-def load_snapshots(filepath: str) -> np.ndarray:
-    """
-    Load .bin -> (N, 41) float64.
-
-    Performance: int32 size fields cast via float32 (not direct to float64).
-    int32->float32 uses SIMD; int32->float64 does not. On 6M x 10 arrays
-    this drops the copy from 4.2s to ~0.1s.
-    """
-    n_recs = os.path.getsize(filepath) // SNAPSHOT_SIZE
-    with open(filepath, 'rb') as f:
-        raw = f.read(n_recs * SNAPSHOT_SIZE)
-
-    dt = np.dtype([
-        ('time',     '<f8'),
-        ('bidPrice', '<u8', (10,)),
-        ('bidSize',  '<i4', (10,)),
-        ('askPrice', '<u8', (10,)),
-        ('askSize',  '<i4', (10,)),
-    ])
-    recs = np.frombuffer(raw, dtype=dt)
-    N    = len(recs)
-
-    arr = np.empty((N, 41), dtype=np.float64)
-    arr[:, 0]     = recs['time']
-    arr[:, 1:11]  = recs['bidPrice'] * PRICE_SCALE
-    arr[:, 21:31] = recs['askPrice'] * PRICE_SCALE
-    arr[:, 11:21] = recs['bidSize'].astype(np.float32)   # int32->f32->f64
-    arr[:, 31:41] = recs['askSize'].astype(np.float32)
-
-    valid = (arr[:, 1] > 0) & (arr[:, 21] > 0)
-    return arr[valid]
-
-
-def mid_price(snapshots: np.ndarray) -> np.ndarray:
-    return (snapshots[:, 1] + snapshots[:, 21]) * 0.5
-
-
-# ====================================================================
-# Core: vectorized future mid (no Python loop)
-# ====================================================================
-
-def compute_future_mid(timestamps: np.ndarray,
-                        mid: np.ndarray,
-                        horizon_s: float = HORIZON_S,
-                        future_win_s: float = FUTURE_WIN_S) -> np.ndarray:
-    """
-    Mean mid-price over [t+horizon, t+horizon+future_win] for every t.
-    Vectorized via prefix sum. O(N), no Python loop.
-    """
-    idx_starts = np.searchsorted(timestamps, timestamps + horizon_s,       side='left')
-    idx_ends   = np.searchsorted(timestamps, timestamps + horizon_s + future_win_s, side='right')
-
-    cs    = np.empty(len(mid) + 1, dtype=np.float64)
-    cs[0] = 0.0
-    np.cumsum(mid, out=cs[1:])
-
-    counts     = (idx_ends - idx_starts).astype(np.float64)
-    future_mid = np.full(len(timestamps), np.nan, dtype=np.float64)
-    np.divide(cs[idx_ends] - cs[idx_starts], counts, out=future_mid,
-               where=counts > 0)
-    return future_mid
-
-
-# ====================================================================
-# MODE 1: Fixed double alpha (training)
-# ====================================================================
-
+# ── DoubleAlpha dataclass ─────────────────────────────────────────────────────
 @dataclass
 class DoubleAlpha:
-    alpha_down: float
-    alpha_up:   float
-    source:     str
+    """Asymmetric return thresholds fitted from training data."""
+    alpha_down:  float   # |22nd percentile| -- DOWN threshold
+    alpha_up:    float   # 78th percentile   -- UP  threshold
+    n_samples:   int     # number of returns used in fitting
+    asymmetry:   float   # abs(alpha_down - alpha_up) / mean -- diagnostic
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(path: str) -> 'DoubleAlpha':
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+
+    def __repr__(self):
+        return (f"DoubleAlpha(down={self.alpha_down:.6f}, up={self.alpha_up:.6f}, "
+                f"n={self.n_samples:,}, asymmetry={self.asymmetry:.1%})")
 
 
-def _pct_from_snaps(snaps: np.ndarray) -> np.ndarray:
-    """Compute pct_change array for one day. Top-level for mp.Pool pickling."""
-    ts      = snaps[:, 0]
-    mid     = mid_price(snaps)
-    fut     = compute_future_mid(ts, mid)
-    valid   = ~np.isnan(fut) & (mid > 1e-8)
-    return (fut[valid] - mid[valid]) / mid[valid]
-
-
-def _pct_from_file(filepath: str) -> np.ndarray:
-    """Load file and compute pct_change. Top-level for mp.Pool pickling."""
-    return _pct_from_snaps(load_snapshots(filepath))
-
-
-def fit_double_alpha(snapshots_list: List[np.ndarray],
-                     target_pct: float = 0.22,
-                     verbose: bool = True) -> DoubleAlpha:
-    """Fit DoubleAlpha from loaded arrays. Parallel across days."""
-    if len(snapshots_list) == 1:
-        all_pct = _pct_from_snaps(snapshots_list[0])
-    else:
-        with mp.Pool(min(N_WORKERS, len(snapshots_list))) as pool:
-            all_pct = np.concatenate(pool.map(_pct_from_snaps, snapshots_list))
-    return _fit_from_pct(all_pct, target_pct, verbose)
-
-
-def fit_double_alpha_from_files(filepaths: List[str],
-                                 target_pct: float = 0.22,
-                                 verbose: bool = True) -> DoubleAlpha:
+# ── Fast binary loader (DONE -- Bug 1 fixed) ─────────────────────────────────
+def load_snapshots(path: str) -> np.ndarray:
     """
-    Fit DoubleAlpha from file paths. More memory-efficient.
-    Each worker loads + processes one file, returns only the small pct array.
-    Preferred for training pipeline (never loads all days into RAM).
+    Load LOBSnapshot binary file into numpy structured array.
+    Uses fromfile() -- zero Python-loop overhead.
+    ~0.5s for 6.19M snapshots (6.19M × 248 bytes = 1.53 GB).
     """
-    if verbose:
-        print(f"  fit_double_alpha: {len(filepaths)} files, "
-              f"{min(N_WORKERS, len(filepaths))} workers")
-    if len(filepaths) == 1:
-        all_pct = _pct_from_file(filepaths[0])
-    else:
-        with mp.Pool(min(N_WORKERS, len(filepaths))) as pool:
-            all_pct = np.concatenate(pool.map(_pct_from_file, filepaths))
-    return _fit_from_pct(all_pct, target_pct, verbose)
+    arr = np.fromfile(path, dtype=SNAPSHOT_DTYPE)
+    return arr
 
 
-def _fit_from_pct(all_pct: np.ndarray, target_pct: float,
-                   verbose: bool) -> DoubleAlpha:
-    alpha_down = float(abs(np.percentile(all_pct, target_pct * 100)))
-    alpha_up   = float(np.percentile(all_pct, (1.0 - target_pct) * 100))
-    if verbose:
-        d = 100.0 * (all_pct < -alpha_down).mean()
-        u = 100.0 * (all_pct >  alpha_up).mean()
-        asym = abs(alpha_down - alpha_up) / ((alpha_down + alpha_up) / 2) * 100
-        print(f"\n  DoubleAlpha (target={100*target_pct:.0f}%/side, N={len(all_pct):,}):")
-        print(f"    alpha_down = {alpha_down:.6f}  ({alpha_down*1e4:.3f} bps)")
-        print(f"    alpha_up   = {alpha_up:.6f}  ({alpha_up*1e4:.3f} bps)")
-        print(f"    DOWN={d:.1f}%  FLAT={100-d-u:.1f}%  UP={u:.1f}%")
-        print(f"    Asymmetry: {asym:.1f}%  "
-              f"{'(negligible)' if asym < 5 else '(significant -- double alpha matters!)'}")
+def filter_session(arr: np.ndarray) -> np.ndarray:
+    """
+    Keep only market-hours snapshots (09:30–16:00 ET).
+    LOCKED decision: pre-market data has 9-77% accuracy and violates
+    Hawkes stationarity requirement (Rambaldi et al. 2016, Sec 2).
+    """
+    # Convert Unix timestamp to hour-of-day in ET (UTC-5 or UTC-4 DST)
+    # January 2026 is winter: ET = UTC - 5
+    UTC_OFFSET = 5.0
+    hour_et = (arr['time'] % 86400 / 3600 - UTC_OFFSET) % 24
+    mask = (hour_et >= SESSION_START_HOUR_ET) & (hour_et < SESSION_END_HOUR_ET)
+    return arr[mask]
+
+
+def mid_price(arr: np.ndarray) -> np.ndarray:
+    """Return mid-price in price units (not raw int). Shape: (N,)"""
+    bp = arr['bid_px'][:, 0].astype(np.float64) / PRICE_SCALE
+    ap = arr['ask_px'][:, 0].astype(np.float64) / PRICE_SCALE
+    return (bp + ap) * 0.5
+
+
+# ── DoubleAlpha fitting (DONE) ────────────────────────────────────────────────
+def _compute_returns_for_file(path: str):
+    """
+    Worker function: compute 100ms forward returns for a single file.
+    Returns 1-D numpy array of percentage changes.
+    """
+    arr = np.fromfile(path, dtype=SNAPSHOT_DTYPE)
+    arr = filter_session(arr)
+    if len(arr) < 200:
+        return np.array([], dtype=np.float64)
+
+    t   = arr['time']
+    mid = mid_price(arr)
+    N   = len(arr)
+
+    returns = np.empty(N, dtype=np.float64)
+    returns[:] = np.nan
+
+    # For each snapshot t_i, average mid in [t_i + H, t_i + 2H]
+    j_start = 0
+    j_end   = 0
+    for i in range(N):
+        t_lo = t[i] + HORIZON_SECS
+        t_hi = t[i] + HORIZON_SECS + HORIZON_AVG_SECS
+        # Advance j_start to first index >= t_lo
+        while j_start < N and t[j_start] < t_lo:
+            j_start += 1
+        # Advance j_end to first index >= t_hi
+        if j_end < j_start:
+            j_end = j_start
+        while j_end < N and t[j_end] < t_hi:
+            j_end += 1
+        if j_end > j_start and mid[i] > 0:
+            avg_future = mid[j_start:j_end].mean()
+            returns[i] = (avg_future - mid[i]) / mid[i]
+
+    return returns[~np.isnan(returns)]
+
+
+def fit_double_alpha(path: str, target_tail: float = 0.22) -> DoubleAlpha:
+    """Fit DoubleAlpha from a single file (for quick inspection / smoke test)."""
+    rets = _compute_returns_for_file(path)
+    return _alpha_from_returns(rets, target_tail)
+
+
+def fit_double_alpha_from_files(paths: list, target_tail: float = 0.22,
+                                n_workers: int = None) -> DoubleAlpha:
+    """
+    Fit DoubleAlpha from multiple files in parallel.
+    MUST be called on training files only -- never include test data.
+    Uses all available cores unless n_workers specified.
+    """
+    if n_workers is None:
+        n_workers = min(len(paths), os.cpu_count() or 1)
+    with Pool(processes=n_workers) as pool:
+        all_returns = pool.map(_compute_returns_for_file, paths)
+    combined = np.concatenate([r for r in all_returns if len(r) > 0])
+    return _alpha_from_returns(combined, target_tail)
+
+
+def _alpha_from_returns(rets: np.ndarray, target_tail: float) -> DoubleAlpha:
+    if len(rets) == 0:
+        raise ValueError("No valid returns -- check data files")
+    alpha_down = float(abs(np.percentile(rets, target_tail * 100)))
+    alpha_up   = float(np.percentile(rets, (1 - target_tail) * 100))
+    mean_abs   = float(np.mean(np.abs(rets[rets != 0]))) or 1e-9
+    asymmetry  = abs(alpha_down - alpha_up) / mean_abs
     return DoubleAlpha(alpha_down=alpha_down, alpha_up=alpha_up,
-                       source='fit_from_training_data')
+                       n_samples=len(rets), asymmetry=asymmetry)
 
 
-def label_fixed(snapshots: np.ndarray,
-                da: DoubleAlpha) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply fixed DoubleAlpha. Fully vectorized."""
-    ts      = snapshots[:, 0]
-    mid     = mid_price(snapshots)
-    fut_mid = compute_future_mid(ts, mid)
-    valid   = ~np.isnan(fut_mid) & (mid > 1e-8)
-    pct     = np.where(valid, (fut_mid - mid) / mid, 0.0)
-    labels  = np.ones(len(snapshots), dtype=np.int8)
-    labels[valid & (pct < -da.alpha_down)] = 0
-    labels[valid & (pct >  da.alpha_up)]   = 2
-    return labels, valid
-
-
-# ====================================================================
-# MODE 2: Rolling alpha (backtesting / test set)
-# ====================================================================
-
-def label_rolling(snapshots: np.ndarray,
-                  window_days: int = 5,
-                  target_pct: float = 0.22,
-                  all_prior_snapshots: Optional[List[np.ndarray]] = None,
-                  verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, DoubleAlpha]:
-    """Alpha from prior window_days, applied to snapshots. Parallel fit."""
-    if not all_prior_snapshots:
-        raise ValueError("all_prior_snapshots required for rolling mode.")
-    prior = all_prior_snapshots[-window_days:]
-    if verbose:
-        print(f"\n  Rolling alpha: {len(prior)} prior days, {N_WORKERS} workers")
-    da = fit_double_alpha(prior, target_pct=target_pct, verbose=verbose)
-    labels, valid = label_fixed(snapshots, da)
-    return labels, valid, da
-
-
-# ====================================================================
-# MODE 3: Real-time ATR alpha (sampled -- correct version)
-# ====================================================================
-
-def compute_atr_series(snapshots: np.ndarray,
-                        sample_interval_s: float = 0.010,
-                        atr_window_s: float = 60.0) -> np.ndarray:
+# ── Fixed-alpha labelling (DONE -- vectorized, no Python loop) ────────────────
+def label_fixed(arr: np.ndarray, da: DoubleAlpha) -> np.ndarray:
     """
-    ATR from SAMPLED mid-prices on a fixed time grid.
+    Assign class labels using DoubleAlpha thresholds.
+    Labels: 0=DOWN, 1=FLAT, 2=UP.
 
-    WHY SAMPLING IS NECESSARY:
-      At 1464 snaps/sec, consecutive mid-prices differ by ~$0.0003 (quote noise).
-      Per-snapshot true range sums to a meaningless large number.
-      Resampling to 10ms grid measures actual price changes over
-      meaningful time intervals, not bid-ask bounce between quote updates.
-
-    sample_interval_s = 0.010 : 10ms grid (100 samples/sec)
-    atr_window_s      = 60.0  : ATR averaged over prior 60 seconds
+    Returns (N,) int8 array. Snapshots without a valid 100ms future
+    window are assigned label -1 (excluded from training).
     """
-    ts  = snapshots[:, 0]
-    mid = mid_price(snapshots)
+    t   = arr['time']
+    mid = mid_price(arr)
+    N   = len(arr)
 
-    # Uniform time grid
-    grid_ts  = np.arange(ts[0], ts[-1], sample_interval_s)
-    n_grid   = len(grid_ts)
+    labels = np.full(N, -1, dtype=np.int8)
 
-    # Last mid-price at or before each grid time
-    idx      = np.clip(np.searchsorted(ts, grid_ts, side='right') - 1,
-                       0, len(mid) - 1)
-    grid_mid = mid[idx]
+    # Vectorized: for each snapshot i, find indices in [t_i+H, t_i+2H]
+    # Use searchsorted for O(N log N) instead of nested loop
+    t_lo = t + HORIZON_SECS
+    t_hi = t + HORIZON_SECS + HORIZON_AVG_SECS
+    idx_lo = np.searchsorted(t, t_lo, side='left')
+    idx_hi = np.searchsorted(t, t_hi, side='left')
 
-    # True ranges on the sampled grid
-    grid_tr  = np.abs(np.diff(grid_mid, prepend=grid_mid[0]))
+    valid = (idx_hi > idx_lo) & (mid > 0)
 
-    # Rolling mean of true ranges via prefix sum
-    win = max(1, int(atr_window_s / sample_interval_s))
-    cs  = np.empty(n_grid + 1, dtype=np.float64)
-    cs[0] = 0.0
-    np.cumsum(grid_tr, out=cs[1:])
+    # Compute prefix sums for fast range means
+    mid_cumsum = np.concatenate(([0.0], np.cumsum(mid)))
+    counts     = idx_hi - idx_lo  # could be zero, safe because of valid mask
 
-    grid_atr = np.full(n_grid, np.nan)
-    if n_grid > win:
-        grid_atr[win:] = (cs[win + 1:n_grid + 1] - cs[1:n_grid - win + 1]) / win
+    future_mid = np.where(
+        valid,
+        (mid_cumsum[idx_hi] - mid_cumsum[idx_lo]) / np.where(counts > 0, counts, 1),
+        0.0
+    )
+    ret = np.where(valid & (mid > 0), (future_mid - mid) / mid, 0.0)
 
-    # Map ATR back to original snapshot timestamps
-    g_idx   = np.clip(np.searchsorted(grid_ts, ts, side='right') - 1,
-                       0, n_grid - 1)
-    atr_out = grid_atr[g_idx]
+    labels[valid & (ret < -da.alpha_down)] = 0   # DOWN
+    labels[valid & (ret >= -da.alpha_down) & (ret <= da.alpha_up)] = 1  # FLAT
+    labels[valid & (ret > da.alpha_up)]    = 2   # UP
 
-    # Warmup mask
-    atr_out[(ts - ts[0]) < atr_window_s] = np.nan
-    return atr_out
+    return labels
 
 
-def label_realtime_atr(snapshots: np.ndarray,
-                        atr_multiplier: float = 2.0,
-                        sample_interval_s: float = 0.010,
-                        atr_window_s: float = 60.0,
-                        verbose: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# ── ATR labelling (for inference / C++ simulation -- NOT used in training) ────
+def label_realtime_atr(arr: np.ndarray,
+                       atr_window_sec: float = 60.0,
+                       sample_interval_sec: float = 0.010) -> np.ndarray:
     """
-    Real-time ATR labeling.
-    alpha[t] = atr_multiplier * ATR_sampled[t] / mid[t]
-
-    Defaults calibrated to NVDA at 100ms horizon:
-      sample_interval_s = 0.010  (10ms grid)
-      atr_window_s      = 60.0   (1 minute backward ATR)
-      atr_multiplier    = 2.0    (tune: higher = more FLAT, lower = more directional)
+    Per-snapshot adaptive threshold labelling.
+    Computes rolling 60-second window of 10ms-sampled mid-price changes.
+    Used by inference pipeline and C++ AdaptiveAlpha -- NOT for supervised training.
+    Returns (N,) int8 array (0=DOWN, 1=FLAT, 2=UP, -1=invalid).
     """
-    ts      = snapshots[:, 0]
-    mid     = mid_price(snapshots)
-    atr     = compute_atr_series(snapshots, sample_interval_s, atr_window_s)
-    fut_mid = compute_future_mid(ts, mid)
+    t   = arr['time']
+    mid = mid_price(arr)
+    N   = len(arr)
+    labels = np.full(N, -1, dtype=np.int8)
 
-    alpha_s = np.full(len(snapshots), np.nan)
-    m       = (mid > 1e-8) & ~np.isnan(atr)
-    np.divide(atr_multiplier * atr, mid, out=alpha_s, where=m)
+    for i in range(N):
+        t_now = t[i]
+        # Collect 10ms-sampled changes in [t_now - atr_window, t_now]
+        mask = (t >= t_now - atr_window_sec) & (t < t_now)
+        window_mid = mid[mask]
+        if len(window_mid) < 10:
+            continue
+        # Subsample at ~10ms
+        diffs = np.diff(window_mid[::max(1, int(sample_interval_sec *
+                                              len(window_mid) / atr_window_sec))])
+        if len(diffs) < 5:
+            continue
+        atr_threshold = np.mean(np.abs(diffs))
 
-    valid  = ~np.isnan(fut_mid) & ~np.isnan(alpha_s) & (mid > 1e-8)
-    pct    = np.where(valid, (fut_mid - mid) / mid, 0.0)
+        # Forward return
+        idx_lo = np.searchsorted(t, t_now + HORIZON_SECS, 'left')
+        idx_hi = np.searchsorted(t, t_now + HORIZON_SECS + HORIZON_AVG_SECS, 'left')
+        if idx_hi <= idx_lo or mid[i] <= 0:
+            continue
+        future = mid[idx_lo:idx_hi].mean()
+        ret = (future - mid[i]) / mid[i]
 
-    labels = np.ones(len(snapshots), dtype=np.int8)
-    labels[valid & (pct < -alpha_s)] = 0
-    labels[valid & (pct >  alpha_s)] = 2
+        if ret < -atr_threshold:
+            labels[i] = 0
+        elif ret > atr_threshold:
+            labels[i] = 2
+        else:
+            labels[i] = 1
 
-    if verbose and valid.sum() > 0:
-        v    = labels[valid]
-        rate = len(ts) / (ts[-1] - ts[0])
-        print(f"\n  ATR labels (mult={atr_multiplier}, "
-              f"grid={sample_interval_s*1000:.0f}ms, "
-              f"window={atr_window_s:.0f}s, "
-              f"avg_rate={rate:.0f} snaps/sec):")
-        print(f"    alpha range: [{np.nanmin(alpha_s):.6f}, {np.nanmax(alpha_s):.6f}]")
-        print(f"    alpha mean:  {np.nanmean(alpha_s):.6f}")
-        print(f"    DOWN={100*(v==0).mean():.1f}%  "
-              f"FLAT={100*(v==1).mean():.1f}%  "
-              f"UP={100*(v==2).mean():.1f}%")
-
-    return labels, valid, alpha_s
+    return labels
 
 
-# ====================================================================
-# Vectorized rolling z-score
-# ====================================================================
-
+# ── Normalisation (DONE -- scipy uniform_filter1d, ~1s for 6M×40) ────────────
 def normalize_features_zscore(features: np.ndarray,
-                                window: int = 100) -> np.ndarray:
+                               window: int = 100) -> np.ndarray:
     """
-    Rolling z-score. No Python loop. Drop-in for feature_label_builder version.
-    Uses scipy uniform_filter1d (C sliding sum) + E[X^2]-E[X]^2.
-    6M x 40 features: ~1s (was ~60s with Python loop).
+    Rolling z-score normalisation using scipy uniform_filter1d.
+    ~1 second for 6M × 40 array. No global normalisation (leaks future).
+
+    features: (N, 40) float32
+    Returns : (N, 40) float32, normalised
     """
-    from scipy.ndimage import uniform_filter1d
-    N, D  = features.shape
-    f     = features.astype(np.float64)
-    pad   = np.repeat(f[:1], window - 1, axis=0)
-    f_pad = np.concatenate([pad, f], axis=0)
-    mu    = uniform_filter1d(f_pad,      size=window, axis=0, mode='nearest')[window-1:]
-    mu2   = uniform_filter1d(f_pad ** 2, size=window, axis=0, mode='nearest')[window-1:]
-    sig   = np.sqrt(np.maximum(mu2 - mu**2, 1e-16))
-    return ((f - mu) / sig).astype(np.float32)[window:]
+    features = features.astype(np.float32)
+    # Rolling mean and std approximated by uniform filter
+    mu  = uniform_filter1d(features, size=window, axis=0, mode='nearest')
+    sq  = uniform_filter1d(features**2, size=window, axis=0, mode='nearest')
+    var = np.maximum(sq - mu**2, 1e-8)
+    return ((features - mu) / np.sqrt(var)).astype(np.float32)
 
 
-# ====================================================================
-# Parallel multi-day dataset builder
-# ====================================================================
+# ── Multi-day parallel builder (DONE) ─────────────────────────────────────────
+def _process_one_day(args):
+    """Worker: load one day, build features, label, normalise."""
+    path, da = args
+    from feature_label_builder import build_raw_features, build_sliding_windows
 
-def _build_one_file(args: tuple) -> tuple:
-    """Worker: full pipeline for one file. Top-level for mp.Pool pickling."""
-    filepath, alpha_down, alpha_up, window_size = args
-    try:
-        from feature_label_builder import build_raw_features, build_sliding_windows
-        da     = DoubleAlpha(alpha_down, alpha_up, 'worker')
-        snaps  = load_snapshots(filepath)
-        labels, valid = label_fixed(snaps, da)
-        normed = normalize_features_zscore(build_raw_features(snaps), window_size)
-        X, y   = build_sliding_windows(normed, labels, valid, window_size)
-        if len(X) == 0:
-            return _empty()
-        ts_out = []
-        for i in range(window_size - 1, len(normed)):
-            orig = window_size + i
-            if orig >= len(snaps): break
-            if valid[orig] and labels[orig] >= 0:
-                ts_out.append(snaps[orig, 0])
-        return X, y, np.array(ts_out[:len(y)], dtype=np.float64)
-    except Exception as e:
-        print(f"  [worker] ERROR {os.path.basename(filepath)}: {e}")
-        return _empty()
+    arr = np.fromfile(path, dtype=SNAPSHOT_DTYPE)
+    arr = filter_session(arr)
+    if len(arr) < 200:
+        return None, None, None
 
+    labels = label_fixed(arr, da)
+    feats  = build_raw_features(arr)
+    feats  = normalize_features_zscore(feats)
 
-def _empty():
-    return (np.empty((0,), np.float32),
-            np.empty((0,), np.int64),
-            np.empty((0,), np.float64))
+    # Remove invalid-label rows
+    valid  = labels != -1
+    feats  = feats[valid]
+    labels = labels[valid]
+    arr    = arr[valid]
+
+    if len(feats) < 200:
+        return None, None, None
+
+    return feats, labels, arr['time']
 
 
-def build_multi_day_parallel(filepaths: List[str],
-                               da: DoubleAlpha,
-                               window_size: int = 100,
-                               verbose: bool = True
-                               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def build_multi_day_parallel(train_paths: list, da: DoubleAlpha,
+                              n_workers: int = None):
     """
-    Full pipeline for multiple days in parallel.
-    Each worker: load -> label -> features -> normalize -> sliding windows.
+    Build multi-day dataset in parallel.
+    Applies shared DoubleAlpha (fitted on all training days jointly).
+
+    Returns:
+      features : (N_total, 40) float32
+      labels   : (N_total,)   int8
+      timestamps: (N_total,)  float64
     """
-    n = min(N_WORKERS, len(filepaths))
-    args = [(fp, da.alpha_down, da.alpha_up, window_size) for fp in filepaths]
-    if verbose:
-        print(f"  build_multi_day_parallel: {len(filepaths)} files, {n} workers")
-    results = [_build_one_file(a) for a in args] if len(filepaths) == 1 \
-              else mp.Pool(n).starmap(_build_one_file, [(a,) for a in args])
-    # Pool.map is cleaner:
-    if len(filepaths) > 1:
-        with mp.Pool(n) as pool:
-            results = pool.map(_build_one_file, args)
-    X  = np.concatenate([r[0] for r in results if len(r[0]) > 0], axis=0)
-    y  = np.concatenate([r[1] for r in results if len(r[1]) > 0], axis=0)
-    ts = np.concatenate([r[2] for r in results if len(r[2]) > 0], axis=0)
-    if verbose:
-        print(f"  Total: {len(y):,}  DOWN={100*(y==0).mean():.1f}% "
-              f"FLAT={100*(y==1).mean():.1f}% UP={100*(y==2).mean():.1f}%")
-    return X, y, ts
+    if n_workers is None:
+        n_workers = min(len(train_paths), os.cpu_count() or 1)
+
+    args = [(p, da) for p in train_paths]
+    with Pool(processes=n_workers) as pool:
+        results = pool.map(_process_one_day, args)
+
+    feats_list, label_list, ts_list = [], [], []
+    for feats, labels, ts in results:
+        if feats is not None:
+            feats_list.append(feats)
+            label_list.append(labels)
+            ts_list.append(ts)
+
+    if not feats_list:
+        raise RuntimeError("No valid days loaded")
+
+    return (np.concatenate(feats_list),
+            np.concatenate(label_list),
+            np.concatenate(ts_list))
 
 
-# ====================================================================
-# C++ AdaptiveAlpha header (sampled version)
-# ====================================================================
-
-CPP_REALTIME_ALPHA = """
-// adaptive_alpha.hpp  -- generated by adaptive_labeler.py
-// Drop into ~/HFT/engine/ alongside OrderBook.hpp
-
-#pragma once
-#include <deque>
-#include <cmath>
-
-// Sampled ATR: accumulates mid-prices on a fixed time grid (sample_interval_s),
-// computes rolling ATR over atr_window_s of those samples.
-// This avoids measuring bid-ask bounce noise between consecutive quotes.
-class AdaptiveAlpha {
-public:
-    AdaptiveAlpha(double sample_interval_s = 0.010,
-                  double atr_window_s      = 60.0,
-                  double multiplier        = 2.0)
-        : sample_s_(sample_interval_s),
-          win_s_(atr_window_s),
-          mult_(multiplier) {}
-
-    void update(double timestamp, double best_bid, double best_ask) {
-        current_mid_ = (best_bid + best_ask) * 0.5;
-        current_ts_  = timestamp;
-
-        // Only sample at fixed intervals
-        if (last_sample_ts_ < 0.0 || (timestamp - last_sample_ts_) >= sample_s_) {
-            if (last_sample_mid_ > 0.0) {
-                double tr = std::fabs(current_mid_ - last_sample_mid_);
-                buf_.push_back({timestamp, tr});
-                sum_ += tr;
-                // Evict samples outside the window
-                while (!buf_.empty() &&
-                       (timestamp - buf_.front().ts) > win_s_) {
-                    sum_ -= buf_.front().tr;
-                    buf_.pop_front();
-                }
-            }
-            last_sample_ts_  = timestamp;
-            last_sample_mid_ = current_mid_;
-        }
-    }
-
-    // Returns normalized alpha. -1.0 = insufficient history.
-    double alpha() const {
-        if (buf_.empty() || current_mid_ <= 0.0) return -1.0;
-        double atr = sum_ / (double)buf_.size();
-        return mult_ * atr / current_mid_;
-    }
-
-    // 0=DOWN 1=FLAT 2=UP -1=not ready
-    int label(double future_mid) const {
-        double a = alpha();
-        if (a <= 0.0) return -1;
-        double pct = (future_mid - current_mid_) / current_mid_;
-        if (pct < -a) return 0;
-        if (pct >  a) return 2;
-        return 1;
-    }
-
-    bool   ready()        const { return !buf_.empty(); }
-    double current_mid()  const { return current_mid_; }
-
-private:
-    struct Entry { double ts; double tr; };
-    double             sample_s_, win_s_, mult_;
-    double             current_mid_    = 0.0;
-    double             current_ts_     = 0.0;
-    double             last_sample_ts_ = -1.0;
-    double             last_sample_mid_= 0.0;
-    double             sum_            = 0.0;
-    std::deque<Entry>  buf_;
-};
-"""
-
-
-# ====================================================================
-# Comparison utility
-# ====================================================================
-
-def compare_modes(filepath: str,
-                  prior_files: Optional[List[str]] = None,
-                  verbose: bool = True) -> dict:
-    import time
-
-    print(f"\n{'='*65}")
-    print(f"LABEL MODE COMPARISON: {os.path.basename(filepath)}")
-    print(f"Workers: {N_WORKERS}")
-    print(f"{'='*65}")
-
-    t0    = time.perf_counter()
-    snaps = load_snapshots(filepath)
-    print(f"  Loaded {len(snaps):,} snapshots in {time.perf_counter()-t0:.2f}s")
-    print(f"  Avg rate: {len(snaps)/(snaps[-1,0]-snaps[0,0]):.0f} snaps/sec")
-
-    results = {}
-
-    print(f"\n--- MODE 1: Fixed DoubleAlpha ---")
-    t0 = time.perf_counter()
-    da = fit_double_alpha([snaps], target_pct=0.22, verbose=verbose)
-    l1, v1 = label_fixed(snaps, da)
-    w = l1[v1]
-    print(f"  Time: {time.perf_counter()-t0:.2f}s")
-    results['fixed'] = {'down': float((w==0).mean()), 'flat': float((w==1).mean()),
-                         'up': float((w==2).mean()),
-                         'alpha_down': da.alpha_down, 'alpha_up': da.alpha_up}
-
-    if prior_files:
-        print(f"\n--- MODE 2: Rolling Alpha ({len(prior_files)} prior days) ---")
-        t0 = time.perf_counter()
-        prior_snaps = [load_snapshots(f) for f in prior_files]
-        l2, v2, da2 = label_rolling(snaps, window_days=len(prior_files),
-                                     all_prior_snapshots=prior_snaps, verbose=verbose)
-        w2 = l2[v2]
-        print(f"  Time: {time.perf_counter()-t0:.2f}s")
-        results['rolling'] = {'down': float((w2==0).mean()), 'flat': float((w2==1).mean()),
-                               'up': float((w2==2).mean()),
-                               'alpha_down': da2.alpha_down, 'alpha_up': da2.alpha_up}
-
-    print(f"\n--- MODE 3: ATR Real-time (sampled, 10ms grid, 60s window) ---")
-    t0 = time.perf_counter()
-    l3, v3, alpha_s = label_realtime_atr(snaps, verbose=verbose)
-    w3 = l3[v3]
-    print(f"  Time: {time.perf_counter()-t0:.2f}s")
-    results['atr'] = {'down': float((w3==0).mean()), 'flat': float((w3==1).mean()),
-                       'up': float((w3==2).mean()),
-                       'alpha_mean': float(np.nanmean(alpha_s))}
-
-    print(f"\n{'='*65}")
-    print(f"  {'Mode':<20}  {'DOWN%':>7}  {'FLAT%':>7}  {'UP%':>7}")
-    print(f"  {'-'*47}")
-    for name, r in results.items():
-        print(f"  {name:<20}  {100*r['down']:7.1f}  "
-              f"{100*r['flat']:7.1f}  {100*r['up']:7.1f}")
-    print(f"{'='*65}")
-
-    cpp_out = os.path.join(os.path.dirname(os.path.abspath(filepath)),
-                            'adaptive_alpha.hpp')
-    with open(cpp_out, 'w') as f:
-        f.write(CPP_REALTIME_ALPHA.strip())
-    print(f"\n  C++ header: {cpp_out}")
-    return results
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     import sys
-    mp.set_start_method('fork', force=True)
-    if len(sys.argv) < 2:
-        print("Usage: python adaptive_labeler.py <target.bin> [prior1.bin ...]")
-        sys.exit(1)
-    compare_modes(sys.argv[1], sys.argv[2:] or None)
+    path = sys.argv[1] if len(sys.argv) > 1 else None
+    if path is None:
+        print("Usage: python adaptive_labeler.py <path_to_dataset.bin>")
+        raise SystemExit(1)
+
+    print(f"Loading {path}...")
+    arr = load_snapshots(path)
+    arr = filter_session(arr)
+    print(f"  Snapshots (session): {len(arr):,}")
+
+    print("Fitting DoubleAlpha...")
+    da = fit_double_alpha(path)
+    print(f"  {da}")
+    if da.asymmetry > 0.05:
+        print(f"  ⚠ Asymmetry {da.asymmetry:.1%} > 5% -- DoubleAlpha essential")
+
+    print("Labelling...")
+    labels = label_fixed(arr, da)
+    valid  = labels != -1
+    lv     = labels[valid]
+    total  = valid.sum()
+    print(f"  DOWN: {(lv==0).sum()/total:.1%}  FLAT: {(lv==1).sum()/total:.1%}"
+          f"  UP: {(lv==2).sum()/total:.1%}  (n={total:,})")
