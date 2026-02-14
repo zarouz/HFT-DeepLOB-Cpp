@@ -1,0 +1,24 @@
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/config.py
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/deeplob_model.py
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/feature_label_builder.py
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/gpu_benchmark.py
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/train_nvda.py
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/tune_alpha.py
+===== scripts/ml/config.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/config.py
+
+===== scripts/ml/deeplob_model.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/deeplob_model.py
+
+===== scripts/ml/feature_label_builder.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/feature_label_builder.py
+
+===== scripts/ml/gpu_benchmark.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/gpu_benchmark.py
+
+===== scripts/ml/train_nvda.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/train_nvda.py
+
+===== scripts/ml/tune_alpha.py =====
+  ✓ patched /Users/karthikyadav/Desktop/Startup/HFT/HFT/scripts/ml/tune_alpha.py
+

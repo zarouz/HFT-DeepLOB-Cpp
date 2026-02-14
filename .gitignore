@@ -1,0 +1,16 @@
+# Binaries
+*.bin
+*.pkl
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data
+data/
+models/
+results/
+
+# Mac
+.DS_Store
